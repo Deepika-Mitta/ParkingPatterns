@@ -1,0 +1,479 @@
+```{r}
+library(tibble)
+library(dplyr)
+library(lubridate)
+
+# 1. Manually extracted home-game dates (Iowa City home games, 2021–2025)
+homegame_dates <- as.Date(c(
+  # 2021–22
+  "2021-09-04","2021-09-18","2021-09-25",
+  "2021-10-09","2021-10-16","2021-11-13","2021-11-20",
+  # 2022–23
+  "2022-09-03","2022-09-10","2022-09-17",
+  "2022-10-01","2022-10-29","2022-11-12","2022-11-25",
+  # 2023–24
+  "2023-09-02","2023-09-16","2023-09-30",
+  "2023-10-07","2023-10-21","2023-11-11","2023-11-18",
+  # 2024–25
+  "2024-08-31","2024-09-07","2024-09-14",
+  "2024-10-12","2024-10-26","2024-11-02","2024-11-29",
+  # First half of 2025 (2025–26 season dates falling in 2025)
+  "2025-08-30","2025-09-13","2025-09-27",
+  "2025-10-25","2025-11-08","2025-11-22"
+), format = "%Y-%m-%d")
+
+# 2. Build a complete daily calendar from Jan 1, 2021 through Dec 31, 2025
+calendar <- tibble(
+  date = seq(as.Date("2021-01-01"), as.Date("2025-12-31"), by = "day")
+)
+
+# 3. Add a homegame flag (1 if date is in homegame_dates, else 0)
+homegame_tbl <- calendar %>%
+  mutate(
+    homegame = as.integer(date %in% homegame_dates)
+  )
+
+# 4. Inspect
+print(homegame_tbl %>% filter(homegame == 1))
+write_csv(homegame_tbl, "homegame_tbl.csv")
+
+```
+
+
+## FORECASTING
+
+```{r}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(timeDate)
+library(forecast)
+library(zoo)
+
+# 1. Load the data ---------------------------------------------------------
+
+# (a) Access‐group assignments (not used in this script but loaded for completeness)
+access <- read_csv("CardAccessGroupAssignment.csv",
+                   col_types = cols(.default = "i"))
+
+# (b) Raw transaction records
+trans_raw <- read_csv("CardTransaction.csv", col_types = cols(
+  TransactionId        = col_double(),
+  CardNumber           = col_double(),
+  LotNumber            = col_double(),
+  NoEntry              = col_double(),
+  NoExit               = col_double(),
+  Overnight            = col_double(),
+  EntranceTime         = col_datetime(format=""),
+  ExitTime             = col_datetime(format=""),
+  EffectiveGroupNumber = col_double()
+))
+```
+
+
+```{r}
+trans <- trans_raw %>%
+  mutate(
+    # if EntranceTime is missing but ExitTime exists → assume entry at midnight of exit date
+    EntranceTime = if_else(
+      is.na(EntranceTime) & !is.na(ExitTime),
+      floor_date(ExitTime, "day"),
+      EntranceTime
+    ),
+    # if ExitTime is missing but EntranceTime exists → assume exit at 23:59:59 of entrance date
+    ExitTime = if_else(
+      is.na(ExitTime) & !is.na(EntranceTime),
+      ceiling_date(EntranceTime, "day") - seconds(1),
+      ExitTime
+    )
+  ) %>%
+  filter(!is.na(EntranceTime) & !is.na(ExitTime))
+```
+
+
+```{r}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(timeDate)
+library(forecast)
+library(data.table)
+library(zoo)
+# 3. Fast splitting of intervals by calendar day using data.table -----------
+
+# Convert to data.table
+trans_dt <- as.data.table(trans)[, row_id := .I]
+
+# Derive date bounds
+trans_dt[, `:=`(
+  start_date = as.Date(EntranceTime),
+  end_date   = as.Date(ExitTime)
+)]
+
+# Explode each interval into (row_id, date) combos
+idx <- trans_dt[
+  , .(date = seq(start_date, end_date, by = "day")),
+  by = row_id
+]
+
+# Merge back LotNumber, EntranceTime, ExitTime
+idx <- merge(
+  idx,
+  trans_dt[, .(row_id, LotNumber, EntranceTime, ExitTime)],
+  by = "row_id",
+  sort = FALSE
+)
+
+# Compute segment start / end per day
+idx[, `:=`(
+  seg_start = pmax(EntranceTime, as_datetime(date)),
+  seg_end   = pmin(ExitTime,   as_datetime(date + days(1)) - seconds(1))
+)]
+
+# Final per-day segments
+trans_days <- as.data.frame(idx[, .(LotNumber, date, seg_start, seg_end)])
+```
+
+
+```{r}
+# 4. Build event stream and compute daily peaks ----------------------------
+
+events <- trans_days %>%
+  rename(start = seg_start, end = seg_end) %>%
+  pivot_longer(c(start, end),
+               names_to  = "type",
+               values_to = "time") %>%
+  mutate(delta = if_else(type == "start", 1L, -1L)) %>%
+  arrange(LotNumber, date, time)
+
+daily_peak <- events %>%
+  group_by(LotNumber, date) %>%
+  mutate(occ = cumsum(delta)) %>%
+  summarise(peak = max(occ), .groups = "drop")
+
+
+```
+
+
+```{r}
+# 5. Calendar regressors ---------------------------------------------------
+
+# (a) Campus holidays via NYSE holidays as proxy
+yrs <- 2021:2025
+holiday_dates <- as.Date(timeDate::holidayNYSE(year = yrs))
+holiday_df <- data.frame(date = holiday_dates, holiday = 1L)
+
+# (b) Real home‐game flag loaded from your table
+homegame_tbl <- read_csv("homegame_tbl.csv", col_types = cols(
+  date     = col_date(format=""),
+  homegame = col_integer()
+))
+
+```
+
+```{r}
+# (c) Merge into a single daily dataset per lot
+daily_all <- daily_peak %>%
+  group_by(LotNumber) %>%
+  complete(date = seq(min(date), as.Date("2025-12-31"), by = "day")) %>%
+  ungroup() %>%
+  replace_na(list(peak = 0)) %>%
+  mutate(
+    # numeric weekday: Sunday=1 ... Saturday=7
+    dow         = wday(date),
+    is_weekend  = if_else(dow %in% c(1, 7), 1L, 0L)
+  ) %>%
+  left_join(holiday_df,   by = "date") %>%
+  left_join(homegame_tbl, by = "date") %>%
+  replace_na(list(holiday = 0L, homegame = 0L)) %>%
+  rename(game = homegame)
+
+```
+
+```{r}
+# 6. Train / Test split for one lot ---------------------------------------
+
+lot_no   <- 10
+df_lot   <- daily_all %>% filter(LotNumber == lot_no)
+
+train_df <- df_lot %>% filter(date < as.Date("2025-01-01"))
+test_df  <- df_lot %>%
+  filter(date >= as.Date("2025-01-01") & date <= as.Date("2025-04-30"))
+
+y_train    <- train_df$peak
+xreg_train <- as.matrix(train_df %>% select(holiday, game, is_weekend))
+
+y_test     <- test_df$peak
+xreg_test  <- as.matrix(test_df  %>% select(holiday, game, is_weekend))
+
+```
+
+
+```{r}
+# 7. Fit SARIMAX via auto.arima() -----------------------------------------
+fit_seasonal <- auto.arima(
+  y_train,
+  xreg           = xreg_train,
+  seasonal       = TRUE,
+  stepwise       = FALSE,
+  approximation  = FALSE,
+  D              = 1,      # seasonal difference
+  max.order      = 10,
+  seasonal.test  = "ocsb", # checks for seasonality
+  trace          = TRUE
+)
+
+summary(fit_seasonal)
+checkresiduals(fit_seasonal)
+
+# Re-compute test RMSE
+fc_test2 <- forecast(fit_seasonal, xreg = xreg_test, h = nrow(test_df))
+rmse2    <- sqrt(mean((fc_test2$mean - y_test)^2, na.rm=TRUE))
+cat("Seasonal model RMSE:", round(rmse2,2), "\n")
+```
+
+```{r}
+# 8. Forecast Jan–Apr 2025 and compute RMSE -------------------------------
+fc_test2 <- forecast(
+  fit_seasonal,
+  xreg = xreg_test,
+  h    = nrow(test_df)
+)
+
+rmse2 <- sqrt(mean((fc_test2$mean - y_test)^2, na.rm = TRUE))
+cat("Seasonal‐diff SARIMAX RMSE (Jan–Apr 2025):", round(rmse2,2), "\n")
+
+```
+
+```{r}
+
+# 9. Forecast May–Dec 2025 ------------------------------------------------
+# Prepare exogenous regressors for May–Dec
+xreg_fut <- as.matrix(
+  future_df %>% select(holiday, game, is_weekend)
+)
+
+fc_seasonal_fut <- forecast(
+  fit_seasonal,
+  xreg = xreg_fut,
+  h    = nrow(future_df)
+)
+
+```
+
+
+```{r}
+# 10. Plot the forecasts ---------------------------------------------------
+library(ggplot2)
+
+# a) Jan–Apr test
+autoplot(fc_test2) +
+  autolayer(
+    ts(y_test,
+       start     = decimal_date(test_df$date[1]),
+       frequency = 7),
+    series = "Actual"
+  ) +
+  ggtitle("Lot 10 — Jan–Apr 2025 Forecast vs Actual (Seasonal SARIMAX)")
+
+# b) May–Dec future
+autoplot(fc_seasonal_fut) +
+  ggtitle("Lot 10 — May–Dec 2025 Peak Usage Forecast\n(Seasonal‐diff SARIMAX)")
+
+# 11. Export the forecast table -------------------------------------------
+fc_table2 <- tibble(
+  date     = future_df$date,
+  forecast = as.numeric(fc_seasonal_fut$mean),
+  lo80     = as.numeric(fc_seasonal_fut$lower[,"80%"]),
+  hi80     = as.numeric(fc_seasonal_fut$upper[,"80%"]),
+  lo95     = as.numeric(fc_seasonal_fut$lower[,"95%"]),
+  hi95     = as.numeric(fc_seasonal_fut$upper[,"95%"])
+)
+
+#print(head(fc_table2, 100))
+#write_csv(fc_table2, sprintf("lot_seasonal_forecast_2025_may_dec.csv", lot_no))
+```
+
+## XGBoost
+```{r}
+# ========================================
+# XGBoost with Bayesian Hyperparameter Optimization
+# install.packages(c("data.table","xgboost","Metrics","rBayesianOptimization","ggplot2"))
+library(data.table)
+library(xgboost)
+library(Metrics)                 # for rmse()
+library(rBayesianOptimization)  # for BayesianOptimization
+library(dplyr)
+library(ggplot2)
+
+# 1. Prepare train/test/future sets ----------------------------------------
+lot_no    <- 10
+train_df  <- daily_all %>%
+  filter(LotNumber == lot_no, date < as.Date("2025-01-01")) %>%
+  arrange(date)
+test_df   <- daily_all %>%
+  filter(LotNumber == lot_no,
+         date >= as.Date("2025-01-01"),
+         date <= as.Date("2025-04-30")) %>%
+  arrange(date)
+future_df <- daily_all %>%
+  filter(LotNumber == lot_no,
+         date >= as.Date("2025-05-01"),
+         date <= as.Date("2025-12-31")) %>%
+  arrange(date)
+
+# 2. Feature engineering (lags + rolling mean) -----------------------------
+all_df <- bind_rows(
+  train_df  %>% mutate(split="train"),
+  test_df   %>% mutate(split="test"),
+  future_df %>% mutate(split="future")
+) %>% as.data.table()
+
+lags <- c(1,7,14); win <- 7
+for (L in lags) {
+  all_df[, paste0("lag",L) := shift(peak, n=L, type="lag"), by = LotNumber]
+}
+all_df[, roll7 := frollmean(peak, n=win, align="right"), by = LotNumber]
+all_df <- all_df[!is.na(lag14) & !is.na(roll7)]
+
+feature_cols <- c("holiday","game","is_weekend", paste0("lag",lags),"roll7")
+train_dat  <- all_df[split=="train"]
+test_dat   <- all_df[split=="test"]
+future_dat <- all_df[split=="future"]
+
+dtrain <- xgb.DMatrix(data = as.matrix(train_dat[, ..feature_cols]),
+                      label = train_dat$peak)
+dtest  <- xgb.DMatrix(data = as.matrix(test_dat[,  ..feature_cols]),
+                      label = test_dat$peak)
+
+# 3. Define Bayesian optimization objective -------------------------------
+xgb_cv_bayes <- function(max_depth, min_child_weight,
+                         subsample, colsample_bytree, eta) {
+  params <- list(
+    booster          = "gbtree",
+    objective        = "reg:squarederror",
+    eval_metric      = "rmse",
+    max_depth        = as.integer(max_depth),
+    min_child_weight = min_child_weight,
+    subsample        = subsample,
+    colsample_bytree = colsample_bytree,
+    eta              = eta
+  )
+  cv <- xgb.cv(
+    params               = params,
+    data                 = dtrain,
+    nrounds              = 1000,
+    nfold                = 5,
+    early_stopping_rounds = 10,
+    verbose              = 0
+  )
+  best_rmse <- min(cv$evaluation_log$test_rmse_mean)
+  list(Score = -best_rmse, nrounds = cv$best_iteration)
+}
+
+# 4. Run Bayesian optimization ---------------------------------------------
+bounds <- list(
+  max_depth        = c(3L, 10L),
+  min_child_weight = c(1,  10),
+  subsample        = c(0.5,1.0),
+  colsample_bytree = c(0.5,1.0),
+  eta              = c(0.01,0.3)
+)
+
+set.seed(2025)
+opt_res <- BayesianOptimization(
+  FUN         = xgb_cv_bayes,
+  bounds      = bounds,
+  init_points = 10,
+  n_iter      = 20,
+  acq         = "ucb",
+  kappa       = 2.576,
+  verbose     = TRUE
+)
+
+# 5. Extract best parameters -----------------------------------------------
+best_params <- opt_res$Best_Par
+params_final <- list(
+  booster          = "gbtree",
+  objective        = "reg:squarederror",
+  eval_metric      = "rmse",
+  max_depth        = as.integer(best_params["max_depth"]),
+  min_child_weight = best_params["min_child_weight"],
+  subsample        = best_params["subsample"],
+  colsample_bytree = best_params["colsample_bytree"],
+  eta              = best_params["eta"]
+)
+cat("Best parameters:\n")
+print(params_final)
+
+# 6. Determine optimal nrounds via CV -------------------------------------
+cv_final <- xgb.cv(
+  params               = params_final,
+  data                 = dtrain,
+  nrounds              = 1000,
+  nfold                = 5,
+  early_stopping_rounds = 10,
+  verbose              = 0
+)
+best_nrounds <- cv_final$best_iteration
+cat("Optimal nrounds from CV:", best_nrounds, "\n")
+
+# 7. Train final model -----------------------------------------------------
+bst_opt <- xgb.train(
+  params    = params_final,
+  data      = dtrain,
+  nrounds   = best_nrounds,
+  verbose   = 0
+)
+
+# 8. Evaluate on Jan–Apr 2025 ----------------------------------------------
+pred_test_opt <- predict(bst_opt, dtest)
+rmse_test_opt <- rmse(test_dat$peak, pred_test_opt)
+cat("XGBoost (BayesOpt) RMSE (Jan–Apr 2025):", round(rmse_test_opt,2), "\n")
+
+# 9. Recursive forecast May–Dec 2025 ---------------------------------------
+buffer <- all_df[split %in% c("train","test")][order(date)]
+buffer <- buffer[(.N - max(lags) - (win-1) + 1):.N]
+
+preds <- numeric(nrow(future_dat))
+for (i in seq_len(nrow(future_dat))) {
+  today    <- future_dat[i]
+  lag_feats<- sapply(lags, function(L) buffer[.N - L + 1, peak])
+  roll_feat<- mean(buffer[(.N - win + 1):.N, peak])
+  xrow     <- c(today$holiday, today$game, today$is_weekend, lag_feats, roll_feat)
+  preds[i] <- predict(bst_opt, xgb.DMatrix(t(xrow)))
+  buffer   <- rbind(buffer,
+                    data.table(LotNumber=lot_no,
+                               date=today$date,
+                               peak=preds[i]),
+                    fill = TRUE)
+}
+
+fc_xgb_opt <- data.table(date = future_dat$date, forecast = preds)
+
+# 10. Plot results ----------------------------------------------------------
+# Test period fit
+ggplot() +
+  geom_line(data=test_dat, aes(x=date, y=peak),   color="black") +
+  geom_line(data=test_dat, aes(x=date, y=pred_test_opt), color="blue") +
+  labs(title=paste("Lot",lot_no,"— XGBoost (BayesOpt) Jan–Apr 2025"),
+       x="Date", y="Daily Peak")
+
+# Future forecast
+ggplot(fc_xgb_opt, aes(x=date, y=forecast)) +
+  geom_line(color="darkgreen") +
+  labs(title=paste("Lot",lot_no,"— XGBoost (BayesOpt) May–Dec 2025"),
+       x="Date", y="Predicted Daily Peak")
+print(head(fc_xgb_opt, 100))
+# (Optional) save forecast
+fwrite(fc_xgb_opt, sprintf("lot_xgb_bayesopt_forecast2025.csv", lot_no))
+
+```
+
+
+
+
+
+
